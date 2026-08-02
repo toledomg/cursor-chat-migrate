@@ -5,7 +5,7 @@ Migra histórico de chats do Cursor após renomear a pasta do projeto.
 
 Uso:
   1. Feche o Cursor completamente.
-  2. Edite OLD_PROJECT_PATH e NEW_PROJECT_PATH abaixo.
+  2. Copie .env.example para .env e edite OLD_PROJECT_PATH e NEW_PROJECT_PATH.
   3. Dry-run:  python migrate-cursor-chats.py
   4. Executar:  python migrate-cursor-chats.py --execute
 
@@ -27,20 +27,34 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote
 
-# =============================================================================
-# CONFIGURAÇÃO — edite apenas estas variáveis
-# =============================================================================
+from dotenv import load_dotenv
 
-OLD_PROJECT_PATH = r"F:\Projetos\meu-projeto-antigo"
-NEW_PROJECT_PATH = r"F:\Projetos\meu-projeto-novo"
+SCRIPT_DIR = Path(__file__).resolve().parent
+load_dotenv(SCRIPT_DIR / ".env")
 
-# Pasta base do Cursor no Windows (raramente precisa mudar)
-CURSOR_USER_DATA = Path(os.environ.get("APPDATA", "")) / "Cursor" / "User"
+
+def _require_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        print(
+            f"ERRO: variável {name} não definida.\n"
+            f"  Copie .env.example para .env e preencha os caminhos do projeto."
+        )
+        raise SystemExit(1)
+    return value
+
+
+def _project_paths() -> tuple[str, str]:
+    return _require_env("OLD_PROJECT_PATH"), _require_env("NEW_PROJECT_PATH")
+
+
+_default_cursor_user = Path(os.environ.get("APPDATA", "")) / "Cursor" / "User"
+CURSOR_USER_DATA = Path(os.getenv("CURSOR_USER_DATA", "") or _default_cursor_user)
 
 # Pasta de projetos do Cursor (~/.cursor/projects)
-CURSOR_HOME_PROJECTS = Path.home() / ".cursor" / "projects"
-
-# =============================================================================
+CURSOR_HOME_PROJECTS = Path(
+    os.getenv("CURSOR_HOME_PROJECTS", "") or (Path.home() / ".cursor" / "projects")
+)
 
 
 def norm_path(path: str) -> str:
@@ -242,13 +256,26 @@ def apply_replacements_text(text: str, pairs: list[tuple[str, str]]) -> str:
 def fetch_disk_kv_candidates(
     cur: sqlite3.Cursor,
     needles: list[str],
+    *,
+    ws_ids: list[str] | None = None,
 ) -> list[tuple[str, str | bytes]]:
     seen_keys: set[str] = set()
     rows: list[tuple[str, str | bytes]] = []
+
+    # IDs de workspace são o filtro mais seletivo (padrão usado na comunidade).
+    search_terms: list[str] = []
+    for ws_id in ws_ids or []:
+        if ws_id and ws_id not in search_terms:
+            search_terms.append(ws_id)
     for needle in needles:
+        if needle and needle not in search_terms:
+            search_terms.append(needle)
+
+    for needle in search_terms:
         if not needle or len(needle) < 3:
             continue
         pattern = f"%{needle}%"
+        print(f"  - Buscando cursorDiskKV com: {needle[:48]}...", flush=True)
         cur.execute(
             "SELECT key, value FROM cursorDiskKV WHERE key LIKE ? OR value LIKE ?",
             (pattern, pattern),
@@ -272,19 +299,21 @@ def patch_global_disk_kv(
     pair_bytes = [(a.encode("utf-8"), b.encode("utf-8")) for a, b in pairs]
     needles = [old for old, _ in pairs]
 
-    conn = sqlite3.connect(db_path)
-    updated = 0
-    scanned = 0
-    try:
-        cur = conn.cursor()
-        print("  - Contando cursorDiskKV (banco grande, aguarde)...", flush=True)
-        cur.execute("SELECT COUNT(*) FROM cursorDiskKV")
-        scanned = int(cur.fetchone()[0])
+    db_size_gb = db_path.stat().st_size / (1024**3)
+    if db_size_gb >= 1:
         print(
-            f"  - Buscando registros com path antigo ({scanned} linhas no total)...",
+            f"  - AVISO: state.vscdb tem {db_size_gb:.1f} GB — varredura pode levar horas.",
             flush=True,
         )
-        rows = fetch_disk_kv_candidates(cur, needles)
+
+    conn = sqlite3.connect(db_path)
+    updated = 0
+    try:
+        cur = conn.cursor()
+        print("  - Buscando registros por workspace ID e paths antigos...", flush=True)
+        rows = fetch_disk_kv_candidates(
+            cur, needles, ws_ids=[old_ws_id, new_ws_id]
+        )
         print(f"  - Candidatos encontrados: {len(rows)}", flush=True)
 
         for index, (key, value) in enumerate(rows, start=1):
@@ -328,7 +357,7 @@ def patch_global_disk_kv(
     finally:
         conn.close()
 
-    return scanned, updated
+    return len(rows), updated
 
 
 def copy_workspace_files(
@@ -434,23 +463,24 @@ def create_backup(
     return backup_dir, actions
 
 
-def run_migration(execute: bool, skip_disk_kv: bool = False) -> int:
+def run_migration(execute: bool, skip_disk_kv: bool = True) -> int:
     dry_run = not execute
+    old_project_path, new_project_path = _project_paths()
 
     print("=" * 60)
     print("Migração de chats Cursor")
     print("=" * 60)
     print(f"Modo: {'EXECUÇÃO' if execute else 'DRY-RUN (simulação)'}")
-    print(f"Antigo: {OLD_PROJECT_PATH}")
-    print(f"Novo:   {NEW_PROJECT_PATH}")
+    print(f"Antigo: {old_project_path}")
+    print(f"Novo:   {new_project_path}")
     print()
 
     if not CURSOR_USER_DATA.is_dir():
         print(f"ERRO: Cursor User não encontrado em {CURSOR_USER_DATA}")
         return 1
 
-    if not Path(NEW_PROJECT_PATH).is_dir():
-        print(f"ERRO: Pasta nova não existe: {NEW_PROJECT_PATH}")
+    if not Path(new_project_path).is_dir():
+        print(f"ERRO: Pasta nova não existe: {new_project_path}")
         return 1
 
     if execute and is_cursor_running():
@@ -461,9 +491,17 @@ def run_migration(execute: bool, skip_disk_kv: bool = False) -> int:
 
     workspace_storage = CURSOR_USER_DATA / "workspaceStorage"
     global_db = CURSOR_USER_DATA / "globalStorage" / "state.vscdb"
+    if global_db.is_file():
+        db_size_gb = global_db.stat().st_size / (1024**3)
+        if db_size_gb >= 1:
+            print(
+                f"AVISO: globalStorage/state.vscdb = {db_size_gb:.1f} GB "
+                f"(banco inchado; etapa cursorDiskKV é opcional e muito lenta)."
+            )
+            print()
 
-    old_ws_id = find_workspace_id(OLD_PROJECT_PATH, workspace_storage)
-    new_ws_id = find_workspace_id(NEW_PROJECT_PATH, workspace_storage)
+    old_ws_id = find_workspace_id(old_project_path, workspace_storage)
+    new_ws_id = find_workspace_id(new_project_path, workspace_storage)
 
     print(f"Workspace ID antigo: {old_ws_id or 'NÃO ENCONTRADO'}")
     print(f"Workspace ID novo:   {new_ws_id or 'NÃO ENCONTRADO'}")
@@ -502,7 +540,7 @@ def run_migration(execute: bool, skip_disk_kv: bool = False) -> int:
         if not isinstance(c, dict):
             continue
         if patch_workspace_identifier(
-            c, OLD_PROJECT_PATH, NEW_PROJECT_PATH, old_ws_id, new_ws_id
+            c, old_project_path, new_project_path, old_ws_id, new_ws_id
         ):
             patched_composers += 1
 
@@ -521,11 +559,11 @@ def run_migration(execute: bool, skip_disk_kv: bool = False) -> int:
         print(f"  - {line}")
 
     print("\n--- workspaceStorage ---")
-    for line in copy_workspace_files(old_ws_dir, new_ws_dir, NEW_PROJECT_PATH, dry_run):
+    for line in copy_workspace_files(old_ws_dir, new_ws_dir, new_project_path, dry_run):
         print(f"  - {line}")
 
     print("\n--- agent-transcripts ---")
-    for line in migrate_agent_transcripts(OLD_PROJECT_PATH, NEW_PROJECT_PATH, dry_run):
+    for line in migrate_agent_transcripts(old_project_path, new_project_path, dry_run):
         print(f"  - {line}")
 
     print("\n--- globalStorage (composer.composerHeaders) ---")
@@ -537,14 +575,20 @@ def run_migration(execute: bool, skip_disk_kv: bool = False) -> int:
 
     if skip_disk_kv:
         print("\n--- globalStorage (cursorDiskKV) ---")
-        print("  - Pulado (--skip-disk-kv). Lista de chats ja foi relinkada acima.")
+        print(
+            "  - Pulado (padrão). composer.composerHeaders + workspaceStorage "
+            "são suficientes na prática (cursor-migrate, cursor-helper, fórum)."
+        )
+        print("  - Use --patch-disk-kv só se algum chat não aparecer depois.")
     else:
         print("\n--- globalStorage (cursorDiskKV, paths antigos) ---")
-        print("  - Etapa lenta (1-5 min). Pode pular com --skip-disk-kv se travar.")
+        print(
+            "  - Varredura profunda (--patch-disk-kv). Pode levar horas se state.vscdb > 1 GB."
+        )
         scanned, kv_updated = patch_global_disk_kv(
             global_db,
-            OLD_PROJECT_PATH,
-            NEW_PROJECT_PATH,
+            old_project_path,
+            new_project_path,
             old_ws_id,
             new_ws_id,
             dry_run,
@@ -557,7 +601,7 @@ def run_migration(execute: bool, skip_disk_kv: bool = False) -> int:
         print("Simulação concluída. Rode com --execute para aplicar.")
     else:
         print("Migração concluída.")
-        print(f"Abra no Cursor: {NEW_PROJECT_PATH}")
+        print(f"Abra no Cursor: {new_project_path}")
         print("Os chats antigos devem aparecer no histórico do projeto novo.")
 
     return 0
@@ -565,8 +609,7 @@ def run_migration(execute: bool, skip_disk_kv: bool = False) -> int:
 
 def run_junction(execute: bool) -> int:
     dry_run = not execute
-    link = OLD_PROJECT_PATH
-    target = NEW_PROJECT_PATH
+    link, target = _project_paths()
 
     print("Modo JUNCTION (atalho do caminho antigo -> pasta nova)")
     print(f"Link:   {link}")
@@ -613,15 +656,24 @@ def main() -> int:
         help="Cria junction do caminho antigo -> novo (método simples, sem mexer no DB).",
     )
     parser.add_argument(
+        "--patch-disk-kv",
+        action="store_true",
+        help=(
+            "Varredura lenta em cursorDiskKV (pode levar horas com state.vscdb grande). "
+            "Normalmente desnecessário — a UI usa composer.composerHeaders."
+        ),
+    )
+    parser.add_argument(
         "--skip-disk-kv",
         action="store_true",
-        help="Pula patch do cursorDiskKV (etapa lenta; chats na UI usam composerHeaders).",
+        help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
 
     if args.junction:
         return run_junction(args.execute)
-    return run_migration(args.execute, skip_disk_kv=args.skip_disk_kv)
+    skip_disk_kv = not args.patch_disk_kv or args.skip_disk_kv
+    return run_migration(args.execute, skip_disk_kv=skip_disk_kv)
 
 
 if __name__ == "__main__":
