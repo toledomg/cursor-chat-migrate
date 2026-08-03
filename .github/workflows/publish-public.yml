@@ -25,4 +25,4 @@ jobs:
 
           git remote add public https://x-access-token:${TOKEN}@github.com/toledomg/cursor-chat-migrate.git
 
-          git push public main --force
+          git push public main:main --force
