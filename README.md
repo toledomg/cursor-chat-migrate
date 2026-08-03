@@ -11,10 +11,12 @@ Quando o caminho do workspace muda, o Cursor trata o projeto como novo e os chat
 ## Features
 
 - Relinka **todos** os chats do workspace (`composerHeaders`, JSON legado e glass)
+- Reescreve paths absolutos dentro dos chats (`composerData` + `bubbleId`) — chips `@file`, `fsPath`, URIs — no padrão do [cursor-helper](https://github.com/lucifer1004/cursor-helper)
 - Dry-run por padrão — nada é gravado sem `--execute`
 - Backup automático com `--revert`
 - Modo `--repair` quando a pasta antiga já não existe
 - Alternativa `--junction` (Windows) sem alterar o SQLite
+- `--scan-orphans` — lista (e opcionalmente arquiva) metadados sem pasta local
 - Paths via flags, `.env` ou prompt interativo
 
 ## Prerequisites
@@ -84,6 +86,24 @@ python migrate-cursor-chats.py --revert 20260802-120000  # por timestamp
 python migrate-cursor-chats.py --revert --execute
 ```
 
+### Limpar backups
+
+Apaga pastas em `%APPDATA%\Cursor\User\backups\cursor-chat-migration-*` (só as criadas por este script). Exclusão permanente — não dá para `--revert` depois.
+
+```bash
+# Só lista (dry-run)
+python migrate-cursor-chats.py --clean-backups
+
+# Apaga todos
+python migrate-cursor-chats.py --clean-backups --execute
+
+# Mantém os 2 mais recentes, apaga o resto
+python migrate-cursor-chats.py --clean-backups --keep 2 --execute
+
+# Apaga um backup específico
+python migrate-cursor-chats.py --clean-backups 20260802-120000 --execute
+```
+
 ### Junction
 
 Cria um junction Windows (`caminho antigo → pasta nova`) sem alterar o SQLite. Requer terminal como Administrador.
@@ -99,6 +119,31 @@ python migrate-cursor-chats.py --junction --execute
 | Move pastas do projeto | Não | Não |
 | Requer Admin | Não | Sim |
 | Abrir projeto por | Caminho **novo** | Caminho **antigo** |
+
+### Scan de órfãos
+
+Lista metadados do Cursor cuja pasta (ou `.code-workspace`) **não existe mais** no disco — lixo acumulado após delete/move de projetos.
+
+```bash
+# Só relatório (dry-run)
+python migrate-cursor-chats.py --scan-orphans
+
+# Arquiva órfãos em backups/ (libera espaço; desfaz com --revert)
+python migrate-cursor-chats.py --scan-orphans --execute
+python migrate-cursor-chats.py --scan-orphans --quit-cursor --execute
+```
+
+O que é varrido:
+
+| Local | Critério de órfão |
+|---|---|
+| `%APPDATA%\Cursor\User\workspaceStorage\*` | `workspace.json` aponta para path inexistente (ou JSON inválido) |
+| `%USERPROFILE%\.cursor\projects\*` | slug com path conhecido via `workspace.json` e pasta local ausente |
+
+- Dry-run imprime **nome do projeto**, path original, pasta de storage e tamanho
+- Com `--execute`, os itens são **movidos** para `backups/` (não `rm` direto) — recuperáveis via `--revert`
+- Slugs opacos (ex.: só dígitos) entram como “não resolvidos” e **não** são removidos automaticamente
+- Drives desmontados / pastas de rede offline também aparecem como órfãos — confira o relatório antes de `--execute`
 
 ## Configuration
 
@@ -126,23 +171,29 @@ O `.env` está no `.gitignore` e não deve ser commitado.
 
 ```
 migrate-cursor-chats.py [-h] [--from CAMINHO] [--to CAMINHO]
-                        [--execute] [--repair] [--revert [BACKUP]]
-                        [--junction] [--quit-cursor] [--force]
-                        [--patch-disk-kv]
+                        [--execute] [--repair] [--scan-orphans]
+                        [--clean-backups [BACKUP]] [--keep N]
+                        [--revert [BACKUP]] [--junction]
+                        [--quit-cursor] [--force] [--patch-disk-kv]
 ```
 
 | Flag | Descrição |
 |---|---|
-| *(sem flags)* | Dry-run — simula sem gravar |
+| *(sem flags)* | Dry-run da migração — simula sem gravar |
 | `--from`, `-f` | Caminho antigo |
 | `--to`, `-t` | Caminho novo |
 | `--execute` | Aplica alterações |
 | `--repair` | Relinka quando a pasta antiga já sumiu |
+| `--scan-orphans` | Lista órfãos; com `--execute`, arquiva em `backups/` |
+| `--clean-backups [BACKUP]` | Lista/apaga backups do script; com `--execute`, confirma e remove |
+| `--keep N` | Com `--clean-backups`, mantém os N mais recentes |
 | `--revert [BACKUP]` | Restaura backup (lista se omitir o nome) |
 | `--junction` | Junction Windows em vez da migração SQLite |
 | `--quit-cursor` | Encerra o Cursor antes de gravar |
 | `--force` | Segue com Cursor aberto (risco de desfazer) |
 | `--patch-disk-kv` | Varredura lenta em `cursorDiskKV` (off por padrão) |
+
+`--revert`, `--junction`, `--scan-orphans` e `--clean-backups` são mutuamente exclusivos.
 
 ## What gets changed
 
