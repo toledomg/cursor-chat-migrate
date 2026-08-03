@@ -1,37 +1,50 @@
 name: Publish Public Repository
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   publish:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Private Repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Debug
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Add Public Remote
         env:
           TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
         run: |
-          set -eux
+          set -euxo pipefail
 
-          echo "Git version"
-          git --version
+          echo "Token length: ${#TOKEN}"
 
-          echo "Current remotes"
-          git remote -v
-
-          echo "Adding public remote"
           git remote add public https://x-access-token:${TOKEN}@github.com/toledomg/cursor-chat-migrate.git
 
-          echo "Testing authentication"
+          git remote -v
+
+          echo "Testing authentication..."
           git ls-remote public
 
-          echo "Pushing..."
+      - name: Push Main
+        env:
+          TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+        run: |
+          set -euxo pipefail
+
           git push public HEAD:main --force
