@@ -1,19 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Migra histórico de chats do Cursor após renomear a pasta do projeto.
+Migra histórico de chats do Cursor após renomear a pasta do projeto,
+e audita/limpa metadados órfãos sem pasta local.
 
-Só metadados do Cursor são alterados (workspaceStorage, globalStorage e
-agent-transcripts). As pastas do projeto no disco nunca são movidas,
-renomeadas ou apagadas.
+Modos:
+  - migração / --repair / --junction / --revert (chats após rename/move)
+  - --scan-orphans (lista ou remove lixo em workspaceStorage e ~/.cursor/projects)
+  - --clean-backups (lista ou apaga pastas em User/backups/)
 
-Uso:
+Na migração, só metadados do Cursor são alterados. As pastas do projeto
+no disco nunca são movidas, renomeadas ou apagadas.
+
+Uso (migração):
   1. Feche o Cursor completamente.
   2. Rode:  python migrate-cursor-chats.py
-     (se não houver .env, o script pergunta origem e destino)
   3. Confira o dry-run e rode:  python migrate-cursor-chats.py --execute
 
-Requisito: abra o projeto NOVO no Cursor pelo menos uma vez antes de rodar,
+Uso (órfãos):
+  python migrate-cursor-chats.py --scan-orphans
+  python migrate-cursor-chats.py --scan-orphans --execute
+
+Uso (limpar backups):
+  python migrate-cursor-chats.py --clean-backups
+  python migrate-cursor-chats.py --clean-backups --execute
+  python migrate-cursor-chats.py --clean-backups --keep 2 --execute
+
+Requisito (migração): abra o projeto NOVO no Cursor pelo menos uma vez,
 para existir a pasta em workspaceStorage com o hash do caminho novo.
 """
 
@@ -38,6 +51,18 @@ from dotenv import load_dotenv
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 load_dotenv(SCRIPT_DIR / ".env")
+
+
+def _configure_stdio() -> None:
+    """Evita UnicodeEncodeError no console Windows (cp1252) com emojis/UTF-8."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (OSError, ValueError, AttributeError):
+            continue
 
 
 def _clean_path(value: str) -> str:
@@ -161,6 +186,87 @@ def cursor_projects_slug(project_path: str) -> str:
     if len(p) >= 2 and p[1] == ":":
         p = p[0].lower() + p[2:]
     return p.replace(":", "").replace("\\", "-").replace("/", "-")
+
+
+def format_bytes(num: int) -> str:
+    """Tamanho legível para relatórios (B / KB / MB / GB)."""
+    size = float(max(0, num))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(size)} B"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def dir_size_bytes(path: Path) -> int:
+    """Soma o tamanho dos arquivos sob path; ignora entradas ilegíveis."""
+    total = 0
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    if not path.is_dir():
+        return 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    total += (Path(root) / name).stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        return total
+    return total
+
+
+def read_workspace_json(ws_dir: Path) -> dict[str, Any] | None:
+    ws_json = ws_dir / "workspace.json"
+    if not ws_json.is_file():
+        return None
+    try:
+        data = json.loads(ws_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def workspace_target_path(data: dict[str, Any]) -> str:
+    """Path local apontado por folder ou workspace (.code-workspace)."""
+    uri = data.get("folder") or data.get("workspace") or ""
+    if not isinstance(uri, str) or not uri.strip():
+        return ""
+    return uri_to_fs_path(uri)
+
+
+def slug_to_project_path(slug: str) -> str | None:
+    """
+    Heurística frágil: f-Projetos-foo -> F:\\Projetos\\foo.
+
+    Ambígua com hífens no nome da pasta (migrate-chats). Só use para
+    confirmar que um slug ainda aponta a um path existente — nunca como
+    única prova de órfão. Órfãos de projects vêm do índice workspace.json.
+    """
+    if not slug or slug.startswith(".") or re.fullmatch(r"\d+", slug):
+        return None
+    parts = slug.split("-")
+    if len(parts) >= 2 and len(parts[0]) == 1 and parts[0].isalpha():
+        drive = f"{parts[0].upper()}:\\"
+        return norm_path(drive + "\\".join(parts[1:]))
+    if parts:
+        return norm_path("/" + "/".join(parts))
+    return None
+
+
+def local_target_exists(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        return Path(path).exists()
+    except OSError:
+        return False
 
 
 def is_cursor_running() -> bool:
@@ -861,6 +967,7 @@ def rebuild_composer_headers_from_workspace(
     migrated: dict[str, dict[str, Any]] = {}
     created = 0
     updated_blobs = 0
+    pairs = build_path_replacements(old_path, new_path, old_ws_id, new_ws_id)
 
     # Também corrige headers já apontando para o destino (re-run).
     existing_by_id: dict[str, dict[str, Any]] = {}
@@ -890,10 +997,25 @@ def rebuild_composer_headers_from_workspace(
             matches_new = (blob_id == new_ws_id) or (
                 fs_path and norm_path(fs_path) == norm_path(new_path)
             )
+            # Também aceita blob que ainda contém o path antigo em qualquer campo.
             if not matches_old and not matches_new:
-                continue
+                raw_probe = json.dumps(data, ensure_ascii=False)
+                if any(old_v in raw_probe for old_v, _ in pairs if len(old_v) > 3):
+                    matches_old = True
+                else:
+                    continue
 
+        # Relinka paths absolutos dentro do JSON (chips @file, fsPath, etc.),
+        # como o cursor-helper faz em composer.composerData / cursorDiskKV.
+        raw = json.dumps(data, ensure_ascii=False)
+        patched = apply_replacements_text(raw, pairs)
+        if patched != raw:
+            try:
+                data = json.loads(patched)
+            except json.JSONDecodeError:
+                pass
         data["workspaceIdentifier"] = make_workspace_identifier(new_path, new_ws_id)
+
         if matches_old or matches_new:
             updated_blobs += 1
             if not dry_run:
@@ -916,8 +1038,110 @@ def rebuild_composer_headers_from_workspace(
     return created, updated_blobs, composers, list(migrated.keys())
 
 
+def rewrite_migrated_chat_paths(
+    global_db: Path,
+    composer_ids: list[str],
+    old_path: str,
+    new_path: str,
+    old_ws_id: str,
+    new_ws_id: str,
+    dry_run: bool,
+) -> tuple[int, int]:
+    """
+    Reescreve paths do projeto antigo → novo nos blobs dos chats migrados.
+
+    Escopo deliberadamente estreito por composerId (não varre o DB inteiro):
+    - composerData:{id}
+    - bubbleId:{id}:*          (mensagens / chips @file — ver cursaves)
+    - messageRequestContext:{id}:*
+    - checkpointId:{id}:*
+
+    Mesmo tipo de substituição path/URI/hash documentado no cursor-helper.
+    """
+    if not composer_ids:
+        return 0, 0
+
+    pairs = build_path_replacements(old_path, new_path, old_ws_id, new_ws_id)
+    pair_bytes = [(a.encode("utf-8"), b.encode("utf-8")) for a, b in pairs]
+    data_updated = 0
+    bubble_updated = 0
+    like_prefixes = (
+        "bubbleId:{composer_id}:%",
+        "messageRequestContext:{composer_id}:%",
+        "checkpointId:{composer_id}:%",
+    )
+
+    def _patch_value(value: str | bytes) -> tuple[str | bytes | None, bool]:
+        if isinstance(value, str):
+            patched = apply_replacements_text(value, pairs)
+            return (patched, patched != value)
+        if isinstance(value, bytes):
+            patched_b = value
+            changed = False
+            for old_b, new_b in pair_bytes:
+                if old_b in patched_b:
+                    patched_b = patched_b.replace(old_b, new_b)
+                    changed = True
+            return (patched_b if changed else value, changed)
+        return (None, False)
+
+    conn = sqlite3.connect(global_db)
+    try:
+        cur = conn.cursor()
+        for composer_id in composer_ids:
+            data_key = f"composerData:{composer_id}"
+            cur.execute(
+                "SELECT value FROM cursorDiskKV WHERE key = ?",
+                (data_key,),
+            )
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                patched, changed = _patch_value(row[0])
+                if changed and patched is not None:
+                    data_updated += 1
+                    if not dry_run:
+                        cur.execute(
+                            "UPDATE cursorDiskKV SET value = ? WHERE key = ?",
+                            (patched, data_key),
+                        )
+
+            for prefix in like_prefixes:
+                cur.execute(
+                    "SELECT key, value FROM cursorDiskKV WHERE key LIKE ?",
+                    (prefix.format(composer_id=composer_id),),
+                )
+                for key, value in cur.fetchall():
+                    if value is None:
+                        continue
+                    patched, changed = _patch_value(value)
+                    if changed and patched is not None:
+                        bubble_updated += 1
+                        if not dry_run:
+                            cur.execute(
+                                "UPDATE cursorDiskKV SET value = ? WHERE key = ?",
+                                (patched, key),
+                            )
+
+        if not dry_run:
+            conn.commit()
+    finally:
+        conn.close()
+
+    return data_updated, bubble_updated
+
+
 def replace_in_blob(data: bytes, old: bytes, new: bytes) -> bytes:
     return data.replace(old, new)
+
+
+def _drive_case_variants(path: str) -> list[str]:
+    """Windows grava paths com drive maiúsculo e minúsculo (F:\\ vs f:\\)."""
+    variants = [path]
+    if len(path) >= 2 and path[1] == ":":
+        upper = path[0].upper() + path[1:]
+        lower = path[0].lower() + path[1:]
+        variants.extend([upper, lower])
+    return list(dict.fromkeys(variants))
 
 
 def build_path_replacements(
@@ -926,15 +1150,29 @@ def build_path_replacements(
     old_ws_id: str,
     new_ws_id: str,
 ) -> list[tuple[str, str]]:
+    """
+    Pares old→new usados no relink de paths (mesmo padrão do cursor-helper:
+    path, URI e workspace hash).
+    """
     old_norm = norm_path(old_path)
     new_norm = norm_path(new_path)
     pairs: list[tuple[str, str]] = [
         (old_ws_id, new_ws_id),
+        (path_to_folder_uri(old_path), path_to_folder_uri(new_path)),
+    ]
+
+    for old_v, new_v in (
         (old_path, new_path),
         (old_norm, new_norm),
         (old_norm.replace("\\", "/"), new_norm.replace("\\", "/")),
-        (path_to_folder_uri(old_path), path_to_folder_uri(new_path)),
-    ]
+        (old_path.replace("\\", "/"), new_path.replace("\\", "/")),
+    ):
+        for old_case in _drive_case_variants(old_v):
+            new_case = new_v
+            if len(old_case) >= 2 and old_case[1] == ":" and len(new_v) >= 2 and new_v[1] == ":":
+                new_case = old_case[0] + new_v[1:]
+            pairs.append((old_case, new_case))
+
     if len(old_norm) > 3 and old_norm[1] == ":":
         old_uri_path = "/" + old_norm[0].upper() + old_norm[2:].replace("\\", "/")
         new_uri_path = "/" + new_norm[0].upper() + new_norm[2:].replace("\\", "/")
@@ -1246,12 +1484,20 @@ def create_backup(
     paths: list[Path],
     dry_run: bool,
     meta: dict[str, Any] | None = None,
+    move: bool = False,
 ) -> tuple[Path, list[str]]:
+    """
+    Copia (padrão) ou move paths para backups/.
+
+    move=True é usado em --scan-orphans --execute: libera espaço em
+    workspaceStorage/projects sem perder a possibilidade de --revert.
+    """
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     backup_dir = backup_root / f"{BACKUP_PREFIX}{timestamp}"
     actions: list[str] = []
     artifacts: list[dict[str, str]] = []
     used: set[str] = set()
+    verb = "Mover" if move else "Backup"
 
     for src in paths:
         if not src.exists():
@@ -1260,7 +1506,7 @@ def create_backup(
         name = backup_entry_name(src, used)
         used.add(name)
         dest = backup_dir / name
-        actions.append(f"Backup: {src} -> {dest}")
+        actions.append(f"{verb}: {src} -> {dest}")
         artifacts.append(
             {
                 "name": name,
@@ -1270,7 +1516,9 @@ def create_backup(
         )
         if not dry_run:
             backup_dir.mkdir(parents=True, exist_ok=True)
-            if src.is_file():
+            if move:
+                shutil.move(str(src), str(dest))
+            elif src.is_file():
                 shutil.copy2(src, dest)
             else:
                 dest.mkdir(parents=True, exist_ok=True)
@@ -1739,13 +1987,40 @@ def run_migration(
     ):
         print(f"  - {line}")
 
+    # Relink paths absolutos nos blobs dos chats (chips @file, fsPath, etc.).
+    # Padrão do cursor-helper: path/URI/hash em composerData:{id} e bubbleId:{id}:*.
+    # Escopo por composerId — não varre o cursorDiskKV inteiro.
+    relink_ids = list(
+        dict.fromkeys(
+            migrated_ids
+            + list_composer_ids_from_headers_table(global_db, new_ws_id)
+            + list_composer_ids_from_headers_table(global_db, old_ws_id or "")
+        )
+    )
+    print("\n--- globalStorage (paths nos chats migrados) ---")
+    data_relinked, bubbles_relinked = rewrite_migrated_chat_paths(
+        global_db,
+        relink_ids,
+        old_project_path,
+        new_project_path,
+        old_ws_id or "",
+        new_ws_id,
+        dry_run,
+    )
+    verb = "Relinkaria" if dry_run else "Relinkado"
+    print(
+        f"  - {verb} paths em {data_relinked} composerData e "
+        f"{bubbles_relinked} bubble(s) "
+        f"({len(relink_ids)} chat(s) no escopo)"
+    )
+
     if skip_disk_kv:
-        print("\n--- globalStorage (cursorDiskKV) ---")
+        print("\n--- globalStorage (cursorDiskKV varredura completa) ---")
         print(
             "  - Varredura completa pulada (padrão). "
-            "composerData dos chats do workspace já é atualizado de forma pontual."
+            "Paths dos chats migrados já foram relinkados acima (composerData + bubbles)."
         )
-        print("  - Use --patch-disk-kv só se ainda faltar algum chat.")
+        print("  - Use --patch-disk-kv só se ainda sobrar referência antiga fora desses chats.")
     else:
         print("\n--- globalStorage (cursorDiskKV, paths antigos) ---")
         print(
@@ -1799,6 +2074,515 @@ def run_migration(
     return 0
 
 
+class OrphanEntry(NamedTuple):
+    kind: str  # workspace | projects | unknown
+    storage_path: Path
+    project_path: str
+    project_name: str
+    size_bytes: int
+    detail: str
+
+
+def build_slug_path_index(workspace_storage: Path) -> dict[str, str]:
+    """
+    slug ~/.cursor/projects -> path declarado em workspace.json.
+
+    Chaves em minúsculas: no Windows o URI/normcase e o nome da pasta
+    em projects/ podem divergir só na capitalização.
+    """
+    index: dict[str, str] = {}
+    if not workspace_storage.is_dir():
+        return index
+
+    for entry in workspace_storage.iterdir():
+        if not entry.is_dir():
+            continue
+        data = read_workspace_json(entry)
+        if not data:
+            continue
+        target = workspace_target_path(data)
+        if not target:
+            continue
+        index[cursor_projects_slug(target).lower()] = target
+    return index
+
+
+def collect_workspace_orphans(workspace_storage: Path) -> list[OrphanEntry]:
+    """workspaceStorage cujo folder/workspace local não existe mais."""
+    orphans: list[OrphanEntry] = []
+    if not workspace_storage.is_dir():
+        return orphans
+
+    for entry in sorted(workspace_storage.iterdir(), key=lambda p: p.name):
+        if not entry.is_dir():
+            continue
+
+        data = read_workspace_json(entry)
+        if data is None:
+            orphans.append(
+                OrphanEntry(
+                    kind="unknown",
+                    storage_path=entry,
+                    project_path="",
+                    project_name=entry.name[:12],
+                    size_bytes=dir_size_bytes(entry),
+                    detail="workspace.json ausente ou inválido",
+                )
+            )
+            continue
+
+        target = workspace_target_path(data)
+        if not target:
+            orphans.append(
+                OrphanEntry(
+                    kind="unknown",
+                    storage_path=entry,
+                    project_path="",
+                    project_name=entry.name[:12],
+                    size_bytes=dir_size_bytes(entry),
+                    detail="workspace.json sem folder/workspace",
+                )
+            )
+            continue
+
+        if local_target_exists(target):
+            continue
+
+        orphans.append(
+            OrphanEntry(
+                kind="workspace",
+                storage_path=entry,
+                project_path=target,
+                project_name=Path(target).name or target,
+                size_bytes=dir_size_bytes(entry),
+                detail="pasta/arquivo local não encontrado",
+            )
+        )
+
+    return orphans
+
+
+def collect_project_orphans(
+    projects_root: Path,
+    slug_index: dict[str, str],
+) -> tuple[list[OrphanEntry], list[OrphanEntry]]:
+    """
+    Retorna (órfãos com path do índice ausente, entradas não resolvidas).
+
+    Só remove projects cujo slug aparece em workspace.json com path morto.
+    Slugs sem índice (numéricos/opacos/hífen ambíguo) ficam como não
+    resolvidos — nunca são apagados automaticamente.
+    """
+    orphans: list[OrphanEntry] = []
+    unresolved: list[OrphanEntry] = []
+    if not projects_root.is_dir():
+        return orphans, unresolved
+
+    for entry in sorted(projects_root.iterdir(), key=lambda p: p.name.lower()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+
+        resolved = slug_index.get(entry.name.lower())
+        if resolved:
+            if local_target_exists(resolved):
+                continue
+            orphans.append(
+                OrphanEntry(
+                    kind="projects",
+                    storage_path=entry,
+                    project_path=resolved,
+                    project_name=Path(resolved).name or resolved,
+                    size_bytes=dir_size_bytes(entry),
+                    detail="pasta local não encontrada",
+                )
+            )
+            continue
+
+        # Heurística só para poupar falso "não resolvido" quando o path vive.
+        guess = slug_to_project_path(entry.name)
+        if guess and local_target_exists(guess):
+            continue
+
+        unresolved.append(
+            OrphanEntry(
+                kind="projects",
+                storage_path=entry,
+                project_path=guess or "",
+                project_name=entry.name,
+                size_bytes=dir_size_bytes(entry),
+                detail="slug sem path confiável no workspaceStorage "
+                "(não removido automaticamente)",
+            )
+        )
+
+    return orphans, unresolved
+
+
+def _confirm_orphan_cleanup(count: int, total_bytes: int) -> bool:
+    if not sys.stdin.isatty():
+        return True
+    try:
+        answer = input(
+            f"Mover {count} órfão(s) (~{format_bytes(total_bytes)}) "
+            f"para backups/? [s/N]: "
+        )
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("s", "sim", "y", "yes")
+
+
+def run_scan_orphans(
+    execute: bool,
+    quit_flag: bool = False,
+    force: bool = False,
+) -> int:
+    """Lista (dry-run) ou arquiva metadados Cursor sem pasta local."""
+    dry_run = not execute
+
+    print("=" * 60)
+    print("Varredura de órfãos do Cursor")
+    print("=" * 60)
+    print(f"Modo: {'EXECUÇÃO' if execute else 'DRY-RUN (apenas relatório)'}")
+    print(f"User data: {CURSOR_USER_DATA}")
+    print(f"Projects:  {CURSOR_HOME_PROJECTS}")
+    print()
+    print(
+        "Critério: path em workspace.json / slug em ~/.cursor/projects "
+        "sem correspondente local."
+    )
+    print(
+        "AVISO: drives desmontados ou pastas em rede offline também "
+        "aparecem como órfãos."
+    )
+    print()
+
+    if not CURSOR_USER_DATA.is_dir():
+        print(f"ERRO: Cursor User não encontrado em {CURSOR_USER_DATA}")
+        return 1
+
+    workspace_storage = CURSOR_USER_DATA / "workspaceStorage"
+    print("Varrendo workspaceStorage...", flush=True)
+    workspace_orphans = collect_workspace_orphans(workspace_storage)
+
+    print("Varrendo ~/.cursor/projects...", flush=True)
+    slug_index = build_slug_path_index(workspace_storage)
+    project_orphans, unresolved = collect_project_orphans(
+        CURSOR_HOME_PROJECTS, slug_index
+    )
+
+    removable = workspace_orphans + project_orphans
+    removable.sort(key=lambda item: item.size_bytes, reverse=True)
+    total_bytes = sum(item.size_bytes for item in removable)
+
+    def _print_group(
+        title: str,
+        items: list[OrphanEntry],
+        detail_limit: int = 40,
+    ) -> None:
+        print(f"\n--- {title} ({len(items)}) ---")
+        if not items:
+            print("  (nenhum)")
+            return
+        ranked = sorted(items, key=lambda item: item.size_bytes, reverse=True)
+        detailed = ranked[:detail_limit]
+        compact = ranked[detail_limit:]
+        for item in detailed:
+            path_label = item.project_path or "(sem path)"
+            print(f"  • {item.project_name}")
+            print(f"      Projeto:  {path_label}")
+            print(f"      Storage:  {item.storage_path}")
+            print(f"      Tamanho:  {format_bytes(item.size_bytes)}")
+            print(f"      Motivo:   {item.detail}")
+        if compact:
+            print(f"  … mais {len(compact)} (lista compacta):")
+            for item in compact:
+                path_label = item.project_path or "(sem path)"
+                print(
+                    f"  - {item.project_name} — {path_label} "
+                    f"({format_bytes(item.size_bytes)})"
+                )
+
+    _print_group("workspaceStorage órfãos", workspace_orphans)
+    _print_group("~/.cursor/projects órfãos", project_orphans)
+    if unresolved:
+        print(f"\n--- projects sem path resolvido ({len(unresolved)}) ---")
+        print("  Ignorados na limpeza automática (slug numérico/opaco).")
+        preview = unresolved[:10]
+        for item in preview:
+            print(
+                f"  • {item.project_name}  "
+                f"({format_bytes(item.size_bytes)}) — {item.storage_path}"
+            )
+        if len(unresolved) > 10:
+            print(f"  … e mais {len(unresolved) - 10}")
+
+    print("\n" + "=" * 60)
+    print(
+        f"Removíveis: {len(removable)}  |  "
+        f"Espaço: ~{format_bytes(total_bytes)}  |  "
+        f"Não resolvidos: {len(unresolved)}"
+    )
+    print("=" * 60)
+
+    if not removable:
+        print("\nNenhum órfão removível encontrado.")
+        return 0
+
+    if dry_run:
+        print("\nDry-run: nada foi removido.")
+        print("Para arquivar os órfãos em backups/ e liberar espaço:")
+        print("  python migrate-cursor-chats.py --scan-orphans --execute")
+        print("Restaurar depois (se precisar): --revert")
+        return 0
+
+    if not ensure_cursor_closed(execute, quit_flag, force):
+        return 1
+
+    if not _confirm_orphan_cleanup(len(removable), total_bytes):
+        print("Cancelado.")
+        return 1
+
+    backup_root = CURSOR_USER_DATA / "backups"
+    paths = [item.storage_path for item in removable]
+    print(f"\nArquivando {len(paths)} item(ns) em {backup_root}...")
+    backup_dir, actions = create_backup(
+        backup_root,
+        paths,
+        dry_run=False,
+        move=True,
+        meta={
+            "mode": "scan-orphans",
+            "orphan_count": len(removable),
+            "total_bytes": total_bytes,
+            "orphans": [
+                {
+                    "kind": item.kind,
+                    "project_path": item.project_path,
+                    "project_name": item.project_name,
+                    "storage": str(item.storage_path),
+                    "size_bytes": item.size_bytes,
+                }
+                for item in removable
+            ],
+        },
+    )
+
+    moved = sum(1 for line in actions if line.startswith("Mover:"))
+    for line in actions:
+        if line.startswith("Mover:") or line.startswith("Gravar"):
+            print(f"  - {line}")
+        elif line.startswith("Pular"):
+            print(f"  - {line}")
+
+    print()
+    print(f"Concluído: {moved} item(ns) movidos para {backup_dir.name}.")
+    print("Os paths dos projetos no disco não foram alterados.")
+    print("Para desfazer: python migrate-cursor-chats.py --revert")
+    return 0
+
+
+def _confirm_backup_cleanup(count: int, total_bytes: int) -> bool:
+    if not sys.stdin.isatty():
+        return True
+    try:
+        answer = input(
+            f"Apagar {count} backup(s) (~{format_bytes(total_bytes)}) "
+            f"permanentemente? [s/N]: "
+        )
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("s", "sim", "y", "yes")
+
+
+def print_backup_entry(backup: Path, size: int | None = None) -> int:
+    """Imprime um backup com nome real do projeto; retorna tamanho em bytes."""
+    if size is None:
+        size = dir_size_bytes(backup)
+    manifest = load_backup_manifest(backup)
+    mode = str((manifest or {}).get("mode") or "?")
+    print(f"  • {backup.name}")
+    print(f"      Tamanho:  {format_bytes(size)}")
+    print(f"      Modo:     {mode}")
+
+    if not manifest:
+        print("      Projeto:  (sem manifest.json)")
+        return size
+
+    old_p = str(manifest.get("from") or "").strip()
+    new_p = str(manifest.get("to") or "").strip()
+    orphans = manifest.get("orphans")
+
+    if mode in ("migrate", "repair") and (old_p or new_p):
+        old_name = Path(old_p).name if old_p else "?"
+        new_name = Path(new_p).name if new_p else "?"
+        if old_p and new_p and norm_path(old_p) != norm_path(new_p):
+            print(f"      Projeto:  {old_name} → {new_name}")
+            print(f"      De:       {old_p}")
+            print(f"      Para:     {new_p}")
+        else:
+            path = new_p or old_p
+            print(f"      Projeto:  {Path(path).name}")
+            print(f"      Path:     {path}")
+    elif isinstance(orphans, list) and orphans:
+        print(f"      Projetos: {len(orphans)}")
+        shown = 0
+        for item in orphans:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("project_name") or "").strip()
+            path = str(item.get("project_path") or "").strip()
+            if not name and path:
+                name = Path(path).name
+            if not name and not path:
+                continue
+            shown += 1
+            if shown > 12:
+                continue
+            kind = str(item.get("kind") or "")
+            kind_bit = f" [{kind}]" if kind else ""
+            if name and path:
+                print(f"        - {name}{kind_bit}")
+                print(f"          {path}")
+            elif name:
+                print(f"        - {name}{kind_bit}")
+            else:
+                print(f"        - {path}{kind_bit}")
+        if shown > 12:
+            print(f"        … e mais {shown - 12}")
+    elif old_p or new_p:
+        path = new_p or old_p
+        print(f"      Projeto:  {Path(path).name}")
+        print(f"      Path:     {path}")
+    else:
+        print("      Projeto:  (sem info no manifest)")
+    return size
+
+
+def run_clean_backups(
+    execute: bool,
+    selection: str = "",
+    keep: int = 0,
+) -> int:
+    """
+    Lista (dry-run) ou apaga pastas de backup criadas por este script
+    em %APPDATA%/Cursor/User/backups/cursor-chat-migration-*.
+    """
+    dry_run = not execute
+    backup_root = CURSOR_USER_DATA / "backups"
+
+    print("=" * 60)
+    print("Limpeza de backups do Cursor")
+    print("=" * 60)
+    print(f"Modo: {'EXECUÇÃO' if execute else 'DRY-RUN (simulação)'}")
+    print(f"Backups em: {backup_root}")
+    if keep > 0 and not selection:
+        print(f"Manter os {keep} mais recentes")
+    print()
+
+    if not backup_root.is_dir():
+        print("Nenhuma pasta de backups encontrada.")
+        return 0
+
+    backups = list_backups(backup_root)
+    if not backups:
+        print("Nenhum backup gerenciado (cursor-chat-migration-*) encontrado.")
+        other = [
+            entry
+            for entry in backup_root.iterdir()
+            if entry.is_dir() and not entry.name.startswith(BACKUP_PREFIX)
+        ]
+        if other:
+            print(
+                f"AVISO: {len(other)} pasta(s) sem o prefixo do script "
+                "foram ignoradas."
+            )
+        return 0
+
+    if selection:
+        chosen = select_backup(backups, selection)
+        if chosen is None:
+            return 1
+        targets = [chosen]
+        if keep > 0:
+            print("AVISO: --keep é ignorado quando um backup específico é informado.")
+    else:
+        # list_backups já vem do mais recente → mais antigo
+        if keep < 0:
+            print("ERRO: --keep deve ser >= 0.")
+            return 1
+        if keep >= len(backups):
+            print(
+                f"Há {len(backups)} backup(s); --keep {keep} não remove nenhum."
+            )
+            for backup in backups:
+                print_backup_entry(backup)
+            return 0
+        kept = backups[:keep] if keep else []
+        targets = backups[keep:] if keep else list(backups)
+        if kept:
+            print(f"--- manter ({len(kept)}) ---")
+            for backup in kept:
+                print_backup_entry(backup)
+            print()
+
+    total_bytes = 0
+    print(f"--- apagar ({len(targets)}) ---")
+    for backup in targets:
+        total_bytes += print_backup_entry(backup)
+
+    print()
+    print(
+        f"Total: {len(targets)} pasta(s)  |  ~{format_bytes(total_bytes)}"
+    )
+    print("AVISO: exclusão é permanente — não há --revert depois disso.")
+
+    if dry_run:
+        print()
+        print("Dry-run: nada foi apagado.")
+        print("Para apagar:")
+        if selection:
+            print(
+                f"  python migrate-cursor-chats.py --clean-backups "
+                f"{selection or targets[0].name} --execute"
+            )
+        elif keep > 0:
+            print(
+                f"  python migrate-cursor-chats.py --clean-backups "
+                f"--keep {keep} --execute"
+            )
+        else:
+            print("  python migrate-cursor-chats.py --clean-backups --execute")
+        return 0
+
+    if not _confirm_backup_cleanup(len(targets), total_bytes):
+        print("Cancelado.")
+        return 1
+
+    removed = 0
+    errors = 0
+    print()
+    for backup in targets:
+        try:
+            shutil.rmtree(backup)
+            removed += 1
+            print(f"  - Apagado: {backup.name}")
+        except OSError as exc:
+            errors += 1
+            print(f"  - ERRO ao apagar {backup.name}: {exc}")
+
+    print()
+    print(f"Concluído: {removed} backup(s) apagado(s).")
+    if errors:
+        print(f"AVISO: {errors} falha(s) ao apagar.")
+        return 1
+    remaining = list_backups(backup_root)
+    if remaining:
+        print(f"Restam {len(remaining)} backup(s) em {backup_root}.")
+    else:
+        print(f"Pasta de backups vazia (prefixo do script): {backup_root}")
+    return 0
+
+
 def run_junction(
     execute: bool,
     old_path: str | None = None,
@@ -1839,10 +2623,12 @@ def run_junction(
 
 
 def main() -> int:
+    _configure_stdio()
     parser = argparse.ArgumentParser(
         description=(
-            "Migra histórico de chats do Cursor após renomear pasta do projeto. "
-            "As pastas do projeto no disco nunca são movidas ou apagadas."
+            "Migra chats do Cursor após renomear pasta do projeto, "
+            "varre/limpa metadados órfãos, ou limpa backups. "
+            "Na migração, as pastas do projeto no disco nunca são movidas ou apagadas."
         )
     )
     parser.add_argument(
@@ -1875,6 +2661,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--scan-orphans",
+        action="store_true",
+        help=(
+            "Lista metadados do Cursor sem pasta local "
+            "(workspaceStorage e ~/.cursor/projects). "
+            "Com --execute, move os órfãos para backups/."
+        ),
+    )
+    parser.add_argument(
         "--revert",
         nargs="?",
         const="",
@@ -1883,6 +2678,28 @@ def main() -> int:
         help=(
             "Restaura um backup anterior. Sem valor, lista e pergunta; "
             "ou informe o nome/timestamp do backup."
+        ),
+    )
+    parser.add_argument(
+        "--clean-backups",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="BACKUP",
+        help=(
+            "Lista ou apaga backups em User/backups/cursor-chat-migration-*. "
+            "Sem valor, todos (respeita --keep); ou informe nome/timestamp. "
+            "Com --execute, apaga após confirmação."
+        ),
+    )
+    parser.add_argument(
+        "--keep",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Com --clean-backups, mantém os N backups mais recentes "
+            "(padrão: 0 = apagar todos)."
         ),
     )
     parser.add_argument(
@@ -1915,6 +2732,30 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    exclusive = [
+        ("--revert", args.revert is not None),
+        ("--junction", args.junction),
+        ("--scan-orphans", args.scan_orphans),
+        ("--clean-backups", args.clean_backups is not None),
+    ]
+    active = [name for name, on in exclusive if on]
+    if len(active) > 1:
+        print(f"ERRO: use apenas um modo por vez: {', '.join(active)}")
+        return 1
+    if args.scan_orphans and args.repair:
+        print("ERRO: --scan-orphans não combina com --repair.")
+        return 1
+    if args.clean_backups is not None and args.repair:
+        print("ERRO: --clean-backups não combina com --repair.")
+        return 1
+    if args.keep and args.clean_backups is None:
+        print("ERRO: --keep só pode ser usado com --clean-backups.")
+        return 1
+    if args.scan_orphans and (args.old_path or args.new_path):
+        print("AVISO: --from/--to são ignorados com --scan-orphans.")
+    if args.clean_backups is not None and (args.old_path or args.new_path):
+        print("AVISO: --from/--to são ignorados com --clean-backups.")
+
     if args.revert is not None:
         return run_revert(args.execute, args.revert, args.quit_cursor, args.force)
     if args.junction:
@@ -1925,6 +2766,11 @@ def main() -> int:
             args.quit_cursor,
             args.force,
         )
+    if args.scan_orphans:
+        return run_scan_orphans(args.execute, args.quit_cursor, args.force)
+    if args.clean_backups is not None:
+        return run_clean_backups(args.execute, args.clean_backups, args.keep)
+
     skip_disk_kv = not args.patch_disk_kv or args.skip_disk_kv
     return run_migration(
         args.execute,
