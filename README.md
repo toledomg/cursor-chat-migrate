@@ -52,6 +52,9 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+No Cursor/VS Code: `Ctrl+Shift+P` → **Python: Select Interpreter** → escolha  
+`.venv\Scripts\python.exe` (o Pylance só resolve imports desse interpretador).
+
 ---
 
 ## Configuração
